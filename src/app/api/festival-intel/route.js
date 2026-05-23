@@ -1,31 +1,19 @@
 import { NextResponse } from "next/server";
 
-const BASE_URL = "https://api.themoviedb.org/3";
+const WIKIDATA_ENDPOINT = "https://query.wikidata.org/sparql";
 
-async function fetchMovieWithCredits(movieId, apiKey) {
-  try {
-    const res = await fetch(
-      `${BASE_URL}/movie/${movieId}?api_key=${apiKey}&append_to_response=credits&language=en-US`
-    );
-    if (!res.ok) return null;
-    return await res.json();
-  } catch {
-    return null;
-  }
-}
-
-function getBuzzLevel(voteAvg, popularity) {
-  if (voteAvg >= 7.5 || popularity >= 100) return "high";
-  if (voteAvg >= 6.5 || popularity >= 30) return "medium";
-  return "low";
-}
-
-function getOscarCategories(genreIds) {
-  const cats = ["Best Picture"];
-  if (genreIds.includes(18)) cats.push("Best Director", "Best Actor", "Best Actress");
-  if (genreIds.includes(36)) cats.push("Best Adapted Screenplay");
-  if (genreIds.includes(10749)) cats.push("Best Original Screenplay");
-  return [...new Set(cats)].slice(0, 4);
+async function queryWikidata(sparql) {
+  const url = new URL(WIKIDATA_ENDPOINT);
+  url.searchParams.set("query", sparql);
+  url.searchParams.set("format", "json");
+  const res = await fetch(url.toString(), {
+    headers: {
+      Accept: "application/sparql-results+json",
+      "User-Agent": "OscarDashboard/1.0 (educational project)",
+    },
+  });
+  if (!res.ok) throw new Error(`Wikidata error ${res.status}`);
+  return res.json();
 }
 
 function getReleaseQuarter(dateStr) {
@@ -35,118 +23,115 @@ function getReleaseQuarter(dateStr) {
 }
 
 export async function POST(request) {
-  const apiKey = process.env.TMDB_API_KEY;
-  if (!apiKey) {
-    return NextResponse.json(
-      { success: false, error: "TMDB_API_KEY not set in .env.local" },
-      { status: 500 }
-    );
-  }
-
   try {
     const { query_type = "festivals" } = await request.json();
 
     if (query_type === "festivals") {
-      // Pull prestige drama films from the Oscar eligibility year
-      const [releasedRes, upcomingRes] = await Promise.all([
-        fetch(
-          `${BASE_URL}/discover/movie?api_key=${apiKey}&language=en-US` +
-          `&with_genres=18&primary_release_date.gte=2026-01-01&primary_release_date.lte=2026-06-30` +
-          `&sort_by=popularity.desc&vote_count.gte=3&page=1`
-        ),
-        fetch(
-          `${BASE_URL}/discover/movie?api_key=${apiKey}&language=en-US` +
-          `&with_genres=18&primary_release_date.gte=2026-07-01&primary_release_date.lte=2026-12-31` +
-          `&sort_by=popularity.desc&page=1`
-        ),
-      ]);
+      // Drama and art-house films from the Oscar eligibility year
+      const sparql = `
+        SELECT DISTINCT ?film ?filmLabel ?directorLabel ?releaseDate
+        WHERE {
+          ?film wdt:P31 wd:Q11424 ;
+                wdt:P577 ?releaseDate .
+          FILTER(YEAR(?releaseDate) = 2026)
+          ?film wdt:P136 ?genre .
+          FILTER(?genre IN (wd:Q130232, wd:Q859369, wd:Q2975633))
+          OPTIONAL { ?film wdt:P57 ?director . }
+          SERVICE wikibase:label { bd:serviceParam wikibase:language "en,mul" . }
+        }
+        ORDER BY DESC(?releaseDate)
+        LIMIT 40
+      `;
 
-      const released = releasedRes.ok ? (await releasedRes.json()).results || [] : [];
-      const upcoming = upcomingRes.ok ? (await upcomingRes.json()).results || [] : [];
+      const data = await queryWikidata(sparql);
+      const bindings = data.results?.bindings || [];
 
-      // Deduplicate and take top 15
       const seen = new Set();
-      const movies = [...released, ...upcoming]
-        .filter((m) => { if (seen.has(m.id)) return false; seen.add(m.id); return true; })
-        .slice(0, 15);
-
-      // Fetch full credits in parallel
-      const detailed = await Promise.all(movies.map((m) => fetchMovieWithCredits(m.id, apiKey)));
-
-      const films = movies.map((movie, i) => {
-        const d = detailed[i];
-        const director = d?.credits?.crew?.find((c) => c.job === "Director")?.name || null;
-        const cast = (d?.credits?.cast || []).slice(0, 3).map((c) => c.name);
-        const distributor = d?.production_companies?.[0]?.name || null;
-
-        return {
-          title: movie.title,
-          director,
-          cast,
+      const films = bindings
+        .filter((b) => {
+          const id = b.film?.value;
+          if (!id || seen.has(id)) return false;
+          const label = b.filmLabel?.value || "";
+          if (label.startsWith("Q")) return false;
+          seen.add(id);
+          return true;
+        })
+        .slice(0, 15)
+        .map((b) => ({
+          title: b.filmLabel?.value || "Unknown",
+          director: b.directorLabel?.value || null,
+          cast: [],
           festival: null,
           festivalSection: null,
-          distributor,
-          releaseWindow: getReleaseQuarter(movie.release_date),
-          buzzLevel: getBuzzLevel(movie.vote_average, movie.popularity),
-          buzzSummary: (movie.overview || "Prestige drama in the Oscar eligibility window.").slice(0, 200),
-          oscarCategories: getOscarCategories(movie.genre_ids || []),
-        };
-      });
+          distributor: null,
+          releaseWindow: getReleaseQuarter(b.releaseDate?.value),
+          buzzLevel: "medium",
+          buzzSummary: `Drama releasing in ${b.releaseDate?.value?.split("T")[0]?.slice(0, 7) || "2026"} — in the Oscar eligibility window.`,
+          oscarCategories: ["Best Picture", "Best Director", "Best Actor", "Best Actress"],
+        }));
 
       return NextResponse.json({
         success: true,
         queryType: "festivals",
         data: films,
         fetchedAt: new Date().toISOString(),
-        source: "TMDB",
+        source: "Wikidata",
       });
     }
 
     if (query_type === "precursors") {
-      // Top dramas from late 2025 + 2026 Oscar eligibility window
-      const res = await fetch(
-        `${BASE_URL}/discover/movie?api_key=${apiKey}&language=en-US` +
-        `&with_genres=18&primary_release_date.gte=2025-10-01&primary_release_date.lte=2026-12-31` +
-        `&sort_by=vote_average.desc&vote_count.gte=20&page=1`
-      );
-      if (!res.ok) throw new Error(`TMDB error ${res.status}`);
-      const films = ((await res.json()).results || []).slice(0, 8);
+      // Recent Best Picture nominees from Wikidata (QID Q102427 = Academy Award for Best Picture)
+      const sparql = `
+        SELECT DISTINCT ?film ?filmLabel ?directorLabel ?castLabel
+        WHERE {
+          ?film wdt:P31 wd:Q11424 .
+          ?film p:P1411 ?nomStat .
+          ?nomStat ps:P1411 wd:Q102427 .
+          ?film wdt:P577 ?releaseDate .
+          FILTER(YEAR(?releaseDate) >= 2024)
+          OPTIONAL { ?film wdt:P57 ?director . }
+          OPTIONAL { ?film wdt:P161 ?cast . }
+          SERVICE wikibase:label { bd:serviceParam wikibase:language "en,mul" . }
+        }
+        LIMIT 50
+      `;
 
-      const detailed = await Promise.all(
-        films.slice(0, 5).map((m) => fetchMovieWithCredits(m.id, apiKey))
-      );
+      const data = await queryWikidata(sparql);
+      const bindings = data.results?.bindings || [];
+
+      // Group multiple cast-member rows back into one film entry
+      const filmMap = new Map();
+      bindings.forEach((b) => {
+        const id = b.film?.value;
+        const label = b.filmLabel?.value || "";
+        if (!id || label.startsWith("Q")) return;
+        if (!filmMap.has(id)) {
+          filmMap.set(id, { title: label, director: b.directorLabel?.value || null, cast: [] });
+        }
+        const castLabel = b.castLabel?.value;
+        if (castLabel && !castLabel.startsWith("Q")) {
+          const entry = filmMap.get(id);
+          if (!entry.cast.includes(castLabel) && entry.cast.length < 4) {
+            entry.cast.push(castLabel);
+          }
+        }
+      });
+
+      const films = [...filmMap.values()].slice(0, 5);
 
       const contender = (mapper) =>
-        films.slice(0, 5).map((m, i) => {
-          const probability = 30 - i * 5;
-          const name = mapper(m, detailed[i]);
-          return { name, title: name, probability };
+        films.slice(0, 5).map((f, i) => {
+          const name = mapper(f) || `Contender — ${f.title}`;
+          return { name, title: name, probability: 30 - i * 5 };
         });
 
       const frontrunners = {
-        bestPicture: contender((m) => m.title),
-        bestDirector: contender((m, d) => {
-          const dir = d?.credits?.crew?.find((c) => c.job === "Director")?.name;
-          return dir ? `${dir} — ${m.title}` : `Director — ${m.title}`;
-        }),
-        bestActor: contender((m, d) => {
-          const lead = (d?.credits?.cast || []).find((c) => c.gender !== 1)?.name;
-          return lead ? `${lead} — ${m.title}` : `Lead Actor — ${m.title}`;
-        }),
-        bestActress: contender((m, d) => {
-          const lead = (d?.credits?.cast || []).find((c) => c.gender === 1)?.name;
-          return lead ? `${lead} — ${m.title}` : `Lead Actress — ${m.title}`;
-        }),
-        bestSupportingActor: contender((m, d) => {
-          const cast = d?.credits?.cast || [];
-          const supp = cast.find((c, i) => c.gender !== 1 && i > 0)?.name;
-          return supp ? `${supp} — ${m.title}` : `Supporting Actor — ${m.title}`;
-        }),
-        bestSupportingActress: contender((m, d) => {
-          const cast = d?.credits?.cast || [];
-          const supp = cast.find((c, i) => c.gender === 1 && i > 0)?.name;
-          return supp ? `${supp} — ${m.title}` : `Supporting Actress — ${m.title}`;
-        }),
+        bestPicture: contender((f) => f.title),
+        bestDirector: contender((f) => f.director ? `${f.director} — ${f.title}` : null),
+        bestActor: contender((f) => f.cast[0] ? `${f.cast[0]} — ${f.title}` : null),
+        bestActress: contender((f) => f.cast[1] ? `${f.cast[1]} — ${f.title}` : null),
+        bestSupportingActor: contender((f) => f.cast[2] ? `${f.cast[2]} — ${f.title}` : null),
+        bestSupportingActress: contender((f) => f.cast[3] ? `${f.cast[3]} — ${f.title}` : null),
       };
 
       return NextResponse.json({
@@ -166,7 +151,7 @@ export async function POST(request) {
           frontrunners,
         },
         fetchedAt: new Date().toISOString(),
-        source: "TMDB",
+        source: "Wikidata",
       });
     }
 

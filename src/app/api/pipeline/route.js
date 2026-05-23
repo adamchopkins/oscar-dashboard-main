@@ -1,42 +1,65 @@
 import { NextResponse } from "next/server";
 
-const BASE_URL = "https://api.themoviedb.org/3";
-const API_KEY = process.env.TMDB_API_KEY;
+const WIKIDATA_ENDPOINT = "https://query.wikidata.org/sparql";
+
+async function queryWikidata(sparql) {
+  const url = new URL(WIKIDATA_ENDPOINT);
+  url.searchParams.set("query", sparql);
+  url.searchParams.set("format", "json");
+  const res = await fetch(url.toString(), {
+    headers: {
+      Accept: "application/sparql-results+json",
+      "User-Agent": "OscarDashboard/1.0 (educational project)",
+    },
+  });
+  if (!res.ok) throw new Error(`Wikidata error ${res.status}`);
+  return res.json();
+}
 
 export async function GET(request) {
   const { searchParams } = new URL(request.url);
-  const year = searchParams.get("year") || "2026";
+  const year = parseInt(searchParams.get("year") || "2026", 10);
 
   try {
-    // Fetch popular upcoming films in the Oscar window
-    const url = `${BASE_URL}/discover/movie?api_key=${API_KEY}&language=en-US&primary_release_date.gte=${year}-01-01&primary_release_date.lte=${year}-12-31&sort_by=popularity.desc&page=1`;
+    const sparql = `
+      SELECT DISTINCT ?film ?filmLabel ?directorLabel ?releaseDate
+      WHERE {
+        ?film wdt:P31 wd:Q11424 ;
+              wdt:P577 ?releaseDate .
+        FILTER(YEAR(?releaseDate) = ${year})
+        OPTIONAL { ?film wdt:P57 ?director . }
+        SERVICE wikibase:label { bd:serviceParam wikibase:language "en,mul" . }
+      }
+      ORDER BY DESC(?releaseDate)
+      LIMIT 40
+    `;
 
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`TMDB error: ${res.status}`);
-    const data = await res.json();
+    const data = await queryWikidata(sparql);
+    const bindings = data.results?.bindings || [];
 
-    const movies = (data.results || []).slice(0, 30).map((movie) => ({
-      id: movie.id,
-      title: movie.title,
-      releaseDate: movie.release_date,
-      overview: movie.overview?.slice(0, 200) + "..." || "",
-      poster: movie.poster_path
-        ? `https://image.tmdb.org/t/p/w342${movie.poster_path}`
-        : null,
-      popularity: movie.popularity,
-      voteAverage: movie.vote_average,
-    }));
+    const seen = new Set();
+    const movies = bindings
+      .filter((b) => {
+        const id = b.film?.value;
+        if (!id || seen.has(id)) return false;
+        const label = b.filmLabel?.value || "";
+        if (label.startsWith("Q")) return false; // skip items with no English label
+        seen.add(id);
+        return true;
+      })
+      .slice(0, 30)
+      .map((b, i) => ({
+        id: b.film.value.split("/").pop(),
+        title: b.filmLabel?.value || "Unknown",
+        releaseDate: b.releaseDate?.value?.split("T")[0] || null,
+        overview: b.directorLabel?.value ? `Directed by ${b.directorLabel.value}.` : "",
+        poster: null,
+        popularity: 30 - i,
+        voteAverage: 0,
+      }));
 
-    return NextResponse.json({
-      success: true,
-      year,
-      count: movies.length,
-      movies,
-    });
+    return NextResponse.json({ success: true, year, count: movies.length, movies });
   } catch (error) {
-    return NextResponse.json(
-      { success: false, error: error.message },
-      { status: 500 }
-    );
+    return NextResponse.json({ success: false, error: error.message }, { status: 500 });
   }
 }
