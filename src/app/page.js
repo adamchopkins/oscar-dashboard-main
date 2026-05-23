@@ -808,7 +808,7 @@ function PipelineView() {
   if (error) return (
     <div className="text-center py-10">
       <p className="text-red-400 mb-2">⚠️ {error}</p>
-      <p className="text-zinc-600 text-sm mb-4">Check your network connection — data loads from Wikidata</p>
+      <p className="text-zinc-600 text-sm mb-4">Pipeline data loads from Wikidata — check your network connection</p>
       <button onClick={fetchPipeline} className="px-4 py-2 rounded-lg bg-zinc-800 text-zinc-300 hover:bg-zinc-700 text-sm">Try Again</button>
     </div>
   );
@@ -882,11 +882,11 @@ function FestivalView() {
       <div className="flex justify-between items-center mb-6">
         <div>
           <h2 className="text-xl font-bold">Festival Intelligence</h2>
-          <p className="text-zinc-500 text-sm">Prestige drama discovery — powered by Wikidata</p>
+          <p className="text-zinc-500 text-sm">Gold Derby · Variety · Deadline · IndieWire · Next Best Picture</p>
         </div>
-        <button onClick={fetchFestivals} disabled={loading} className="px-3 py-1.5 rounded-lg border border-zinc-800 text-zinc-400 text-sm hover:bg-zinc-800 disabled:opacity-50">{loading ? "Loading..." : "🔍 Search Wikidata"}</button>
+        <button onClick={fetchFestivals} disabled={loading} className="px-3 py-1.5 rounded-lg border border-zinc-800 text-zinc-400 text-sm hover:bg-zinc-800 disabled:opacity-50">{loading ? "Loading..." : "📡 Fetch Live Data"}</button>
       </div>
-      {loading && <div className="text-center py-16"><div className="inline-block animate-spin rounded-full h-8 w-8 border-2 border-zinc-600 border-t-amber-500 mb-4" /><p className="text-zinc-400">Querying Wikidata for 2026 dramas...</p></div>}
+      {loading && <div className="text-center py-16"><div className="inline-block animate-spin rounded-full h-8 w-8 border-2 border-zinc-600 border-t-amber-500 mb-4" /><p className="text-zinc-400">Scanning Gold Derby, Variety, Deadline, IndieWire...</p><p className="text-zinc-600 text-sm mt-1">Ranking films by cross-source mention count</p></div>}
       {error && <div className="text-center py-10"><p className="text-red-400 mb-2">⚠️ {error}</p><button onClick={fetchFestivals} className="px-4 py-2 rounded-lg bg-zinc-800 text-zinc-300 hover:bg-zinc-700 text-sm">Try Again</button></div>}
       {!loading && !fetched && !error && <div className="text-center py-16"><p className="text-zinc-500 text-4xl mb-4">🎪</p><p className="text-zinc-400">Click <strong>Ask Claude</strong> to search for festival selections.</p></div>}
       {!loading && fetched && Object.entries(grouped).map(([festival, festFilms]) => (
@@ -936,9 +936,9 @@ function PrecursorView() {
     <div>
       <div className="flex justify-between items-center mb-6">
         <div><h2 className="text-xl font-bold">Precursor Awards Tracker</h2><p className="text-zinc-500 text-sm">Guild & critics awards — strongest Oscar predictors</p></div>
-        <button onClick={fetchPrecursors} disabled={loading} className="px-3 py-1.5 rounded-lg border border-zinc-800 text-zinc-400 text-sm hover:bg-zinc-800 disabled:opacity-50">{loading ? "Loading..." : "🔍 Search Wikidata"}</button>
+        <button onClick={fetchPrecursors} disabled={loading} className="px-3 py-1.5 rounded-lg border border-zinc-800 text-zinc-400 text-sm hover:bg-zinc-800 disabled:opacity-50">{loading ? "Loading..." : "📡 Fetch Live Data"}</button>
       </div>
-      {loading && <div className="text-center py-16"><div className="inline-block animate-spin rounded-full h-8 w-8 border-2 border-zinc-600 border-t-amber-500 mb-4" /><p className="text-zinc-400">Querying Wikidata for Oscar contenders...</p></div>}
+      {loading && <div className="text-center py-16"><div className="inline-block animate-spin rounded-full h-8 w-8 border-2 border-zinc-600 border-t-amber-500 mb-4" /><p className="text-zinc-400">Scanning Gold Derby, Variety, Deadline, IndieWire...</p><p className="text-zinc-600 text-sm mt-1">Ranking contenders by mention frequency</p></div>}
       {error && <div className="text-center py-10"><p className="text-red-400 mb-2">⚠️ {error}</p><button onClick={fetchPrecursors} className="px-4 py-2 rounded-lg bg-zinc-800 text-zinc-300 hover:bg-zinc-700 text-sm">Try Again</button></div>}
       {!loading && !fetched && !error && <div className="text-center py-16"><p className="text-zinc-500 text-4xl mb-4">🏅</p><p className="text-zinc-400">Click <strong>Ask Claude</strong> to search for precursor data.</p></div>}
       {!loading && fetched && data && data.frontrunners && Object.entries(data.frontrunners).map(([category, contenders]) => (
@@ -1073,7 +1073,7 @@ function PredictionsView() {
       <div className="flex items-center gap-3 mb-4">
         <div className="flex items-center gap-2 text-xs text-zinc-600">
           <div className={`w-2 h-2 rounded-full ${dataSource === "live" ? "bg-green-500" : dataSource.includes("cached") ? "bg-amber-500" : "bg-zinc-600"}`} />
-          Data: {dataSource === "live" ? "Live from Wikidata (open film database)" : dataSource.includes("cached") ? "Cached Wikidata data" : "Placeholder — click Fetch Live Predictions for real data"}
+          Data: {dataSource === "live" ? "Live — Gold Derby · Variety · Deadline · IndieWire · Next Best Picture" : dataSource.includes("cached") ? "Cached from prediction feeds" : "Placeholder — click Fetch Live Predictions for real data"}
         </div>
         {ceremonyInfo?.sources && (
           <div className="text-xs text-zinc-700">
@@ -1086,8 +1086,9 @@ function PredictionsView() {
       {loading && (
         <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-8 mb-6 text-center">
           <div className="inline-block animate-spin rounded-full h-8 w-8 border-2 border-zinc-600 border-t-amber-500 mb-4" />
-          <p className="text-zinc-300 font-medium">Querying Wikidata for Oscar contenders...</p>
-          <p className="text-zinc-600 text-sm mt-2">Searching prestige dramas from the Oscar eligibility year — no API key needed</p>
+          <p className="text-zinc-300 font-medium">Scanning prediction feeds...</p>
+          <p className="text-zinc-600 text-sm mt-2">Gold Derby · Variety · Deadline · IndieWire · Next Best Picture · The Ankler</p>
+          <p className="text-zinc-700 text-xs mt-1">Ranking films by how many sources are buzzing about them</p>
         </div>
       )}
 

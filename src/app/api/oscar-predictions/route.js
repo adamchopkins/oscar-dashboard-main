@@ -1,75 +1,75 @@
 // src/app/api/oscar-predictions/route.js
+// Aggregates real-time RSS feeds from Gold Derby, Variety, Deadline, IndieWire,
+// Next Best Picture, and The Ankler. Films mentioned most across those sources
+// are ranked as frontrunners. Wikidata fills in director names and any gaps.
 
 import { NextResponse } from "next/server";
-
-const WIKIDATA_ENDPOINT = "https://query.wikidata.org/sparql";
-
-async function queryWikidata(sparql) {
-  const url = new URL(WIKIDATA_ENDPOINT);
-  url.searchParams.set("query", sparql);
-  url.searchParams.set("format", "json");
-  const res = await fetch(url.toString(), {
-    headers: {
-      Accept: "application/sparql-results+json",
-      "User-Agent": "OscarDashboard/1.0 (educational project)",
-    },
-  });
-  if (!res.ok) throw new Error(`Wikidata error ${res.status}`);
-  return res.json();
-}
+import {
+  PREDICTION_FEEDS,
+  fetchFeed,
+  filterOscarArticles,
+  extractFilmTitles,
+  countMentions,
+  getWikidataFilms,
+} from "@/lib/oscarFeeds";
 
 export async function POST(request) {
   try {
     const { ceremony = "99th", year = 2027 } = await request.json();
-    const eligibilityYear = year - 1; // 2026 for 99th Oscars
+    const eligibilityYear = year - 1; // 2026 for the 99th Oscars
 
-    // Query for drama films from the eligibility year already known to Wikidata
-    const sparql = `
-      SELECT DISTINCT ?film ?filmLabel ?directorLabel ?castLabel
-      WHERE {
-        ?film wdt:P31 wd:Q11424 ;
-              wdt:P577 ?releaseDate .
-        FILTER(YEAR(?releaseDate) = ${eligibilityYear})
-        ?film wdt:P136 ?genre .
-        FILTER(?genre IN (wd:Q130232, wd:Q859369))
-        OPTIONAL { ?film wdt:P57 ?director . }
-        OPTIONAL { ?film wdt:P161 ?cast . }
-        SERVICE wikibase:label { bd:serviceParam wikibase:language "en,mul" . }
-      }
-      LIMIT 60
-    `;
+    // RSS feeds + Wikidata in parallel
+    const [feedResults, wdFilms] = await Promise.all([
+      Promise.all(PREDICTION_FEEDS.map(fetchFeed)),
+      getWikidataFilms(eligibilityYear),
+    ]);
 
-    const data = await queryWikidata(sparql);
-    const bindings = data.results?.bindings || [];
+    const allArticles = feedResults.flat();
+    const oscarArticles = filterOscarArticles(allArticles);
+    const activeSources = PREDICTION_FEEDS
+      .filter((_, i) => feedResults[i].length > 0)
+      .map((f) => f.name);
 
-    // Group multiple cast rows back into one entry per film
-    const filmMap = new Map();
-    bindings.forEach((b) => {
-      const id = b.film?.value;
-      const label = b.filmLabel?.value || "";
-      if (!id || label.startsWith("Q")) return;
-      if (!filmMap.has(id)) {
-        filmMap.set(id, { title: label, director: b.directorLabel?.value || null, cast: [] });
-      }
-      const castLabel = b.castLabel?.value;
-      if (castLabel && !castLabel.startsWith("Q")) {
-        const entry = filmMap.get(id);
-        if (!entry.cast.includes(castLabel) && entry.cast.length < 4) {
-          entry.cast.push(castLabel);
-        }
-      }
-    });
+    // Extract quoted film titles from articles, count cross-source mentions
+    const articlesText = oscarArticles.map((a) => a.title + " " + a.description).join(" ");
+    const rssTitles = extractFilmTitles(articlesText);
+    const mentionMap = new Map(
+      rssTitles.map((t) => [t, countMentions(oscarArticles, t)])
+    );
 
-    const films = [...filmMap.values()].slice(0, 8);
+    // Wikidata index for director lookup
+    const wdMap = new Map(wdFilms.map((f) => [f.title.toLowerCase(), f]));
 
-    if (films.length === 0) {
+    // Build ranked film list: RSS mentions first, then Wikidata gap-fill
+    const rankedFromRSS = [...mentionMap.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([title, mentionCount]) => ({
+        title,
+        director: wdMap.get(title.toLowerCase())?.director || null,
+        mentionCount,
+      }));
+
+    const wdOnly = wdFilms
+      .filter((f) => !mentionMap.has(f.title))
+      .map((f) => ({ title: f.title, director: f.director, mentionCount: 0 }));
+
+    const rankedFilms = [...rankedFromRSS, ...wdOnly].slice(0, 10);
+
+    if (rankedFilms.length === 0) {
       throw new Error(
-        `No ${eligibilityYear} drama films found in Wikidata yet — check back as more films are added throughout the year.`
+        "No film data returned from prediction feeds or Wikidata. Please try again."
       );
     }
 
     const nom = (mapper, count = 6) =>
-      films.slice(0, count).map((f) => mapper(f) || `Contender — ${f.title}`);
+      rankedFilms
+        .slice(0, count)
+        .map((f) => mapper(f) || `Contender — ${f.title}`);
+
+    const frontrunnerNote = (f) =>
+      f.mentionCount > 0
+        ? `Most discussed across ${activeSources.slice(0, 3).join(", ")} (${f.mentionCount} article${f.mentionCount !== 1 ? "s" : ""})`
+        : `Top ${eligibilityYear} drama in Wikidata`;
 
     const categories = [
       {
@@ -77,47 +77,51 @@ export async function POST(request) {
         name: "Best Picture",
         icon: "🏆",
         nominees: nom((f) => f.title, 8),
-        frontrunner: films[0]?.title,
-        frontrunnerNote: `Top ${eligibilityYear} drama in Wikidata`,
+        frontrunner: rankedFilms[0]?.title,
+        frontrunnerNote: frontrunnerNote(rankedFilms[0]),
       },
       {
         id: "bestDirector",
         name: "Best Director",
         icon: "🎬",
-        nominees: nom((f) => f.director ? `${f.director} — ${f.title}` : null),
-        frontrunner: films[0]?.director ? `${films[0].director} — ${films[0].title}` : `Director — ${films[0]?.title}`,
-        frontrunnerNote: "Director of the season's top drama",
+        nominees: nom((f) =>
+          f.director ? `${f.director} — ${f.title}` : null
+        ),
+        frontrunner: rankedFilms[0]?.director
+          ? `${rankedFilms[0].director} — ${rankedFilms[0].title}`
+          : `Director — ${rankedFilms[0]?.title}`,
+        frontrunnerNote: "Director of most-discussed prestige film",
       },
       {
         id: "bestActor",
         name: "Best Actor",
         icon: "🎭",
-        nominees: nom((f) => f.cast[0] ? `${f.cast[0]} — ${f.title}` : null),
-        frontrunner: films[0]?.cast[0] ? `${films[0].cast[0]} — ${films[0].title}` : `Lead Actor — ${films[0]?.title}`,
-        frontrunnerNote: "Lead male performance in top prestige film",
+        nominees: nom((f) => `Lead Actor — ${f.title}`),
+        frontrunner: `Lead Actor — ${rankedFilms[0]?.title}`,
+        frontrunnerNote: "Lead performance in top prestige film",
       },
       {
         id: "bestActress",
         name: "Best Actress",
         icon: "👑",
-        nominees: nom((f) => f.cast[1] ? `${f.cast[1]} — ${f.title}` : null),
-        frontrunner: films[0]?.cast[1] ? `${films[0].cast[1]} — ${films[0].title}` : `Lead Actress — ${films[0]?.title}`,
+        nominees: nom((f) => `Lead Actress — ${f.title}`),
+        frontrunner: `Lead Actress — ${rankedFilms[0]?.title}`,
         frontrunnerNote: "Lead female performance in top prestige film",
       },
       {
         id: "bestSupportingActor",
         name: "Best Supporting Actor",
         icon: "🌟",
-        nominees: nom((f) => f.cast[2] ? `${f.cast[2]} — ${f.title}` : null),
-        frontrunner: films[0]?.cast[2] ? `${films[0].cast[2]} — ${films[0].title}` : `Supporting Actor — ${films[0]?.title}`,
+        nominees: nom((f) => `Supporting Actor — ${f.title}`),
+        frontrunner: `Supporting Actor — ${rankedFilms[0]?.title}`,
         frontrunnerNote: "Supporting performance in top contenders",
       },
       {
         id: "bestSupportingActress",
         name: "Best Supporting Actress",
         icon: "✨",
-        nominees: nom((f) => f.cast[3] ? `${f.cast[3]} — ${f.title}` : null),
-        frontrunner: films[0]?.cast[3] ? `${films[0].cast[3]} — ${films[0].title}` : `Supporting Actress — ${films[0]?.title}`,
+        nominees: nom((f) => `Supporting Actress — ${f.title}`),
+        frontrunner: `Supporting Actress — ${rankedFilms[0]?.title}`,
         frontrunnerNote: "Supporting female performance in top contenders",
       },
     ];
@@ -127,14 +131,21 @@ export async function POST(request) {
       data: {
         ceremonyName: `${ceremony} Academy Awards`,
         ceremonyYear: year,
-        lastUpdated: new Date().toLocaleDateString("en-US", { month: "long", year: "numeric" }),
-        sources: ["Wikidata"],
+        lastUpdated: new Date().toLocaleDateString("en-US", {
+          month: "long",
+          year: "numeric",
+        }),
+        sources: activeSources,
         categories,
       },
+      articlesScanned: oscarArticles.length,
       fetchedAt: new Date().toISOString(),
     });
   } catch (error) {
     console.error("Oscar predictions API error:", error);
-    return NextResponse.json({ success: false, error: error.message }, { status: 500 });
+    return NextResponse.json(
+      { success: false, error: error.message },
+      { status: 500 }
+    );
   }
 }
