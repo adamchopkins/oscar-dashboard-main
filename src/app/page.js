@@ -801,14 +801,14 @@ function PipelineView() {
   if (loading) return (
     <div className="text-center py-16">
       <div className="inline-block animate-spin rounded-full h-8 w-8 border-2 border-zinc-600 border-t-blue-500 mb-4" />
-      <p className="text-zinc-400">Querying Wikidata...</p>
+      <p className="text-zinc-400">Loading from Wikipedia + awards feeds...</p>
     </div>
   );
 
   if (error) return (
     <div className="text-center py-10">
       <p className="text-red-400 mb-2">⚠️ {error}</p>
-      <p className="text-zinc-600 text-sm mb-4">Pipeline data loads from Wikidata — check your network connection</p>
+      <p className="text-zinc-600 text-sm mb-4">Pipeline loads from Wikipedia — check your network connection</p>
       <button onClick={fetchPipeline} className="px-4 py-2 rounded-lg bg-zinc-800 text-zinc-300 hover:bg-zinc-700 text-sm">Try Again</button>
     </div>
   );
@@ -818,7 +818,7 @@ function PipelineView() {
       <div className="flex justify-between items-center mb-6">
         <div>
           <h2 className="text-xl font-bold">Production Pipeline</h2>
-          <p className="text-zinc-500 text-sm">Films in the Oscar eligibility window — from Wikidata</p>
+          <p className="text-zinc-500 text-sm">Wikipedia · sorted by Gold Derby / Variety / Deadline buzz</p>
         </div>
         <button onClick={fetchPipeline} className="px-3 py-1.5 rounded-lg border border-zinc-800 text-zinc-400 text-sm hover:bg-zinc-800">🔄 Refresh</button>
       </div>
@@ -834,7 +834,11 @@ function PipelineView() {
               <div className="min-w-0">
                 <h3 className="font-semibold text-sm truncate text-zinc-200">{movie.title}</h3>
                 <p className="text-zinc-500 text-xs mt-1">{movie.releaseDate || "TBD"}</p>
-                {movie.voteAverage > 0 && <span className="inline-block mt-2 px-2 py-0.5 rounded-full border border-zinc-700 text-xs text-zinc-400">⭐ {movie.voteAverage.toFixed(1)}</span>}
+                {movie.oscarMentions > 0 && (
+                  <span className="inline-block mt-2 px-2 py-0.5 rounded-full border border-amber-800/40 bg-amber-900/10 text-xs text-amber-400">
+                    📡 {movie.oscarMentions} mention{movie.oscarMentions !== 1 ? "s" : ""}
+                  </span>
+                )}
                 <p className="text-zinc-600 text-xs mt-2 line-clamp-2">{movie.overview}</p>
               </div>
             </div>

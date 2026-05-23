@@ -1,65 +1,49 @@
+// Pipeline API — live 2026 film list via Wikipedia MediaWiki API.
+// No API key required. Supplements film metadata with Oscar buzz signals
+// from the same Gold Derby / Variety / Deadline RSS feeds used elsewhere.
+
 import { NextResponse } from "next/server";
-
-const WIKIDATA_ENDPOINT = "https://query.wikidata.org/sparql";
-
-async function queryWikidata(sparql) {
-  const url = new URL(WIKIDATA_ENDPOINT);
-  url.searchParams.set("query", sparql);
-  url.searchParams.set("format", "json");
-  const res = await fetch(url.toString(), {
-    headers: {
-      Accept: "application/sparql-results+json",
-      "User-Agent": "OscarDashboard/1.0 (educational project)",
-    },
-  });
-  if (!res.ok) throw new Error(`Wikidata error ${res.status}`);
-  return res.json();
-}
+import {
+  PREDICTION_FEEDS,
+  fetchFeed,
+  filterOscarArticles,
+  countMentions,
+  getWikipediaFilms,
+} from "@/lib/oscarFeeds";
 
 export async function GET(request) {
   const { searchParams } = new URL(request.url);
   const year = parseInt(searchParams.get("year") || "2026", 10);
 
   try {
-    const sparql = `
-      SELECT DISTINCT ?film ?filmLabel ?directorLabel ?releaseDate
-      WHERE {
-        ?film wdt:P31 wd:Q11424 ;
-              wdt:P577 ?releaseDate .
-        FILTER(YEAR(?releaseDate) = ${year})
-        OPTIONAL { ?film wdt:P57 ?director . }
-        SERVICE wikibase:label { bd:serviceParam wikibase:language "en,mul" . }
-      }
-      ORDER BY DESC(?releaseDate)
-      LIMIT 40
-    `;
+    // Fetch Wikipedia film list and award RSS feeds in parallel
+    const [wikiMovies, feedResults] = await Promise.all([
+      getWikipediaFilms(year),
+      Promise.all(PREDICTION_FEEDS.map(fetchFeed)),
+    ]);
 
-    const data = await queryWikidata(sparql);
-    const bindings = data.results?.bindings || [];
+    const oscarArticles = filterOscarArticles(feedResults.flat());
 
-    const seen = new Set();
-    const movies = bindings
-      .filter((b) => {
-        const id = b.film?.value;
-        if (!id || seen.has(id)) return false;
-        const label = b.filmLabel?.value || "";
-        if (label.startsWith("Q")) return false; // skip items with no English label
-        seen.add(id);
-        return true;
-      })
-      .slice(0, 30)
-      .map((b, i) => ({
-        id: b.film.value.split("/").pop(),
-        title: b.filmLabel?.value || "Unknown",
-        releaseDate: b.releaseDate?.value?.split("T")[0] || null,
-        overview: b.directorLabel?.value ? `Directed by ${b.directorLabel.value}.` : "",
-        poster: null,
-        popularity: 30 - i,
-        voteAverage: 0,
-      }));
+    // Annotate each Wikipedia film with its mention count across award feeds.
+    // Films talked about by Gold Derby / Variety / Deadline rise to the top.
+    const movies = wikiMovies
+      .map((m) => ({
+        ...m,
+        oscarMentions: countMentions(oscarArticles, m.title),
+      }))
+      .sort((a, b) => b.oscarMentions - a.oscarMentions);
 
-    return NextResponse.json({ success: true, year, count: movies.length, movies });
+    return NextResponse.json({
+      success: true,
+      year,
+      count: movies.length,
+      movies,
+      source: "Wikipedia + Gold Derby / Variety / Deadline (RSS)",
+    });
   } catch (error) {
-    return NextResponse.json({ success: false, error: error.message }, { status: 500 });
+    return NextResponse.json(
+      { success: false, error: error.message },
+      { status: 500 }
+    );
   }
 }
