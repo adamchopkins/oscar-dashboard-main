@@ -1,7 +1,12 @@
-// Festival Intelligence API — powered by RSS feeds from Gold Derby, Variety,
-// Deadline, IndieWire, Next Best Picture, and The Ankler.
-// Films are ranked by how many of those sources are currently discussing them.
-// Wikipedia MediaWiki API fills in film metadata when RSS is sparse.
+// Festival Intelligence & Precursor Awards — live data.
+//
+// Buzz signal:    10 RSS feeds (Gold Derby, Variety, Deadline, Hollywood Reporter,
+//                 IndieWire, Next Best Picture, Awards Circuit, The Wrap,
+//                 Entertainment Weekly, The Ankler) — all fetched with no-store cache.
+// Film metadata:  TMDB drama/history films for 2026 (requires TMDB_API_KEY)
+//                 Falls back to Wikipedia if key is absent.
+// Ranking:        Films ranked by cross-source mention frequency — more sources
+//                 discussing a film = higher buzz level and probability score.
 
 import { NextResponse } from "next/server";
 import {
@@ -10,6 +15,7 @@ import {
   filterOscarArticles,
   extractFilmTitles,
   countMentions,
+  getTMDBOscarContenders,
   getWikipediaFilms,
   releaseQuarter,
 } from "@/lib/oscarFeeds";
@@ -17,59 +23,63 @@ import {
 export async function POST(request) {
   try {
     const { query_type = "festivals" } = await request.json();
+    const apiKey = process.env.TMDB_API_KEY;
 
-    // All feeds + Wikipedia run in parallel
-    const [feedResults, wikiFilms] = await Promise.all([
+    // RSS feeds + film catalog — all parallel
+    const [feedResults, filmCatalog] = await Promise.all([
       Promise.all(PREDICTION_FEEDS.map(fetchFeed)),
-      getWikipediaFilms(2026),
+      apiKey ? getTMDBOscarContenders(2026, apiKey) : getWikipediaFilms(2026),
     ]);
 
-    const allArticles  = feedResults.flat();
+    const catalog = filmCatalog ?? await getWikipediaFilms(2026);
+
+    const allArticles   = feedResults.flat();
     const oscarArticles = filterOscarArticles(allArticles);
     const activeSources = PREDICTION_FEEDS
       .filter((_, i) => feedResults[i].length > 0)
       .map((f) => f.name);
 
-    // Extract quoted film titles from articles and rank by cross-source mentions
+    // Extract all quoted titles from award articles, count cross-source mentions
     const articlesText = oscarArticles.map((a) => a.title + " " + a.description).join(" ");
     const rssTitles    = extractFilmTitles(articlesText);
     const mentionMap   = new Map(rssTitles.map((t) => [t, countMentions(oscarArticles, t)]));
 
-    // Wikipedia lookup for release date enrichment
-    const wikiMap = new Map(wikiFilms.map((f) => [f.title.toLowerCase(), f]));
+    // Build catalog lookup for metadata enrichment
+    const catalogMap = new Map(catalog.map((f) => [f.title.toLowerCase(), f]));
 
-    // Ranked list: RSS titles first (sorted by mention count), then Wikipedia gap-fill
+    // Ranked title list: RSS-mentioned first (by count), then catalog gap-fill
     const rssRanked = [...mentionMap.entries()]
       .sort((a, b) => b[1] - a[1])
-      .map(([title]) => title);
-    const wikiOnly  = wikiFilms.map((f) => f.title).filter((t) => !mentionMap.has(t));
-    const allTitles = [...new Set([...rssRanked, ...wikiOnly])];
+      .map(([t]) => t);
+    const catalogOnly = catalog
+      .map((f) => f.title)
+      .filter((t) => !mentionMap.has(t));
+    const allTitles = [...new Set([...rssRanked, ...catalogOnly])];
 
-    // ── FESTIVALS query ────────────────────────────────────────────────────
+    // ── FESTIVALS ──────────────────────────────────────────────────────────
     if (query_type === "festivals") {
       const films = allTitles.slice(0, 20).map((title) => {
-        const wd       = wikiMap.get(title.toLowerCase());
-        const mentions = mentionMap.get(title) || 0;
-
-        const mentionedIn = oscarArticles.find((a) =>
+        const meta     = catalogMap.get(title.toLowerCase());
+        const mentions = mentionMap.get(title) ?? 0;
+        const lead     = oscarArticles.find((a) =>
           (a.title + " " + a.description).toLowerCase().includes(title.toLowerCase())
         );
-        const buzzSummary = mentionedIn
-          ? `"${mentionedIn.title.slice(0, 80)}" — ${mentionedIn.source}`
-          : "2026 film in Oscar eligibility window.";
-
         return {
           title,
-          director:      null,
-          cast:          [],
-          festival:      null,
+          director:        null,
+          cast:            [],
+          festival:        null,
           festivalSection: null,
-          distributor:   null,
-          releaseWindow: releaseQuarter(wd?.releaseDate),
-          buzzLevel:     mentions >= 5 ? "high" : mentions >= 2 ? "medium" : "low",
-          buzzSummary,
+          distributor:     null,
+          poster:          meta?.poster ?? null,
+          releaseWindow:   releaseQuarter(meta?.releaseDate),
+          buzzLevel:       mentions >= 5 ? "high" : mentions >= 2 ? "medium" : "low",
+          buzzSummary:     lead
+            ? `"${lead.title.slice(0, 80)}" — ${lead.source}`
+            : "2026 film in Oscar eligibility window.",
           oscarCategories: ["Best Picture", "Best Director"],
-          mentionCount:  mentions,
+          mentionCount:    mentions,
+          voteAverage:     meta?.voteAverage ?? 0,
         };
       });
 
@@ -79,11 +89,12 @@ export async function POST(request) {
         data:            films,
         articlesScanned: oscarArticles.length,
         sources:         activeSources,
+        tmdbConfigured:  !!apiKey,
         fetchedAt:       new Date().toISOString(),
       });
     }
 
-    // ── PRECURSORS query ───────────────────────────────────────────────────
+    // ── PRECURSORS ─────────────────────────────────────────────────────────
     if (query_type === "precursors") {
       const topTitles = [...mentionMap.entries()]
         .sort((a, b) => b[1] - a[1])
@@ -92,37 +103,29 @@ export async function POST(request) {
       let frontrunners;
 
       if (topTitles.length >= 3) {
-        // Enough RSS signal — rank purely by mention count
         const makeContenders = (mapper) =>
           topTitles.slice(0, 5).map(([title, count], i) => {
-            const name        = mapper(title);
-            const probability = Math.min(90, 32 - i * 5 + Math.min(count * 3, 15));
-            return { name, title: name, probability };
+            const name = mapper(title);
+            return { name, title: name, probability: Math.min(90, 32 - i * 5 + Math.min(count * 3, 15)) };
           });
-
         frontrunners = {
-          bestPicture:          makeContenders((t) => t),
-          bestDirector:         makeContenders((t) => `Director — ${t}`),
-          bestActor:            makeContenders((t) => `Lead Actor — ${t}`),
-          bestActress:          makeContenders((t) => `Lead Actress — ${t}`),
-          bestSupportingActor:  makeContenders((t) => `Supporting Actor — ${t}`),
+          bestPicture:           makeContenders((t) => t),
+          bestDirector:          makeContenders((t) => `Director — ${t}`),
+          bestActor:             makeContenders((t) => `Lead Actor — ${t}`),
+          bestActress:           makeContenders((t) => `Lead Actress — ${t}`),
+          bestSupportingActor:   makeContenders((t) => `Supporting Actor — ${t}`),
           bestSupportingActress: makeContenders((t) => `Supporting Actress — ${t}`),
         };
       } else {
-        // RSS sparse — fall back to Wikipedia film list
-        const fallback = wikiFilms.slice(0, 5);
-        const c = (mapper) =>
-          fallback.map((f, i) => ({
-            name:        mapper(f),
-            title:       mapper(f),
-            probability: 30 - i * 5,
-          }));
+        // RSS sparse — fall back to catalog (TMDB or Wikipedia)
+        const fb = catalog.slice(0, 5);
+        const c  = (fn) => fb.map((f, i) => ({ name: fn(f), title: fn(f), probability: 30 - i * 5 }));
         frontrunners = {
-          bestPicture:          c((f) => f.title),
-          bestDirector:         c((f) => `Director — ${f.title}`),
-          bestActor:            c((f) => `Lead Actor — ${f.title}`),
-          bestActress:          c((f) => `Lead Actress — ${f.title}`),
-          bestSupportingActor:  c((f) => `Supporting Actor — ${f.title}`),
+          bestPicture:           c((f) => f.title),
+          bestDirector:          c((f) => `Director — ${f.title}`),
+          bestActor:             c((f) => `Lead Actor — ${f.title}`),
+          bestActress:           c((f) => `Lead Actress — ${f.title}`),
+          bestSupportingActor:   c((f) => `Supporting Actor — ${f.title}`),
           bestSupportingActress: c((f) => `Supporting Actress — ${f.title}`),
         };
       }
@@ -133,8 +136,8 @@ export async function POST(request) {
         data: {
           season: "2026-2027",
           precursors: [
-            { name: "Golden Globes",  status: "upcoming", date: "January 2027" },
-            { name: "Critics Choice", status: "upcoming", date: "January 2027" },
+            { name: "Golden Globes",  status: "upcoming", date: "January 2027"  },
+            { name: "Critics Choice", status: "upcoming", date: "January 2027"  },
             { name: "SAG Awards",     status: "upcoming", date: "February 2027" },
             { name: "DGA Awards",     status: "upcoming", date: "February 2027" },
             { name: "PGA Awards",     status: "upcoming", date: "February 2027" },
@@ -145,6 +148,7 @@ export async function POST(request) {
         },
         articlesScanned: oscarArticles.length,
         sources:   activeSources,
+        tmdbConfigured: !!apiKey,
         fetchedAt: new Date().toISOString(),
       });
     }
