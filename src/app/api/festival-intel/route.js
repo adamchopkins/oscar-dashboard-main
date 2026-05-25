@@ -1,11 +1,14 @@
-// Festival Intelligence & Precursor Awards — long-term consensus model.
+// Festival Intelligence & Precursor Awards — TMDB-first, consensus-scored.
 //
-// Scoring:     Same consensus model as oscar-predictions — site authority × prediction weight
-//              × cross-site agreement. Short-term buzz spikes are dampened; sustained
-//              multi-site coverage of a film is the durable signal.
-// Oscar window: Jul–Dec releases weighted 2× (peak campaign/FYC season)
+// Film data:     TMDB getTMDBOscarContenders (primary) — Wikipedia fallback if no key
+// Enrichment:    enrichFilmsWithCredits adds director + cast to top festival contenders
+// Scoring:       Same consensus model as oscar-predictions
 
 import { NextResponse } from "next/server";
+import {
+  getTMDBOscarContenders,
+  enrichFilmsWithCredits,
+} from "@/lib/tmdb";
 import {
   PREDICTION_FEEDS,
   fetchFeed,
@@ -14,7 +17,6 @@ import {
   extractFilmTitles,
   computeConsensusScore,
   getOscarSeasonBonus,
-  getTMDBOscarContenders,
   getWikipediaFilms,
   releaseQuarter,
 } from "@/lib/oscarFeeds";
@@ -22,15 +24,15 @@ import {
 export async function POST(request) {
   try {
     const { query_type = "festivals" } = await request.json();
-    const apiKey = process.env.TMDB_API_KEY;
-    const ELIGIBILITY_YEAR = 2026;
+    const apiKey            = process.env.TMDB_API_KEY;
+    const ELIGIBILITY_YEAR  = 2026;
 
-    const [feedResults, filmCatalog] = await Promise.all([
+    const [feedResults, tmdbCatalog] = await Promise.all([
       Promise.all(PREDICTION_FEEDS.map(fetchFeed)),
-      apiKey ? getTMDBOscarContenders(ELIGIBILITY_YEAR, apiKey) : getWikipediaFilms(ELIGIBILITY_YEAR),
+      apiKey ? getTMDBOscarContenders(ELIGIBILITY_YEAR, apiKey) : null,
     ]);
 
-    const catalog = filmCatalog ?? await getWikipediaFilms(ELIGIBILITY_YEAR);
+    const catalog = tmdbCatalog ?? await getWikipediaFilms(ELIGIBILITY_YEAR);
 
     const allArticles   = feedResults.flat();
     const oscarArticles = filterOscarArticles(allArticles);
@@ -41,72 +43,77 @@ export async function POST(request) {
       .filter((_, i) => feedResults[i].length > 0)
       .map((f) => f.name);
 
-    // Extract titles from prediction articles (primary) and general Oscar coverage
-    const predText  = predArticles.map((a) => a.title + " " + a.description).join(" ");
-    const oscarText = oscarArticles.map((a) => a.title + " " + a.description).join(" ");
     const allTitles = [...new Set([
-      ...extractFilmTitles(predText),
-      ...extractFilmTitles(oscarText),
+      ...extractFilmTitles(predArticles.map((a) => a.title + " " + a.description).join(" ")),
+      ...extractFilmTitles(oscarArticles.map((a) => a.title + " " + a.description).join(" ")),
     ])];
 
-    // Score each title with the consensus model
     const titleScores = new Map(
       allTitles.map((t) => [t, computeConsensusScore(oscarArticles, predArticles, t)])
     );
 
     const catalogMap = new Map(catalog.map((f) => [f.title.toLowerCase(), f]));
 
-    // Sorted titles: consensus score descending
+    // Sorted by consensus score descending, TMDB catalog as gap-fill
     const rssRanked  = [...titleScores.entries()]
       .filter(([, s]) => s.rawMentions > 0)
       .sort((a, b) => b[1].consensusScore - a[1].consensusScore)
       .map(([t]) => t);
-    const catalogOnly = catalog
-      .map((f) => f.title)
-      .filter((t) => !titleScores.has(t));
-    const allRanked = [...new Set([...rssRanked, ...catalogOnly])];
+    const catalogOnly = catalog.map((f) => f.title).filter((t) => !titleScores.has(t));
+    const allRanked   = [...new Set([...rssRanked, ...catalogOnly])];
 
     // ── FESTIVALS ──────────────────────────────────────────────────────────
     if (query_type === "festivals") {
+      // Enrich top 8 with TMDB credits for director/cast info
+      const topForEnrichment = allRanked.slice(0, 8).map((title) => ({
+        title,
+        ...(catalogMap.get(title.toLowerCase()) ?? {}),
+      }));
+      const enriched    = await enrichFilmsWithCredits(topForEnrichment, ELIGIBILITY_YEAR, apiKey, 8);
+      const enrichedMap = new Map(enriched.map((f) => [f.title, f]));
+
       const films = allRanked.slice(0, 20).map((title) => {
-        const meta   = catalogMap.get(title.toLowerCase());
-        const score  = titleScores.get(title);
+        const meta        = catalogMap.get(title.toLowerCase());
+        const score       = titleScores.get(title);
+        const enrichedFilm = enrichedMap.get(title);
         const windowBonus = getOscarSeasonBonus(meta?.releaseDate ?? null, ELIGIBILITY_YEAR);
-        const effectiveMentions = score?.rawMentions ?? 0;
+        const mentions    = score?.rawMentions ?? 0;
 
         const lead = oscarArticles.find((a) =>
           (a.title + " " + a.description).toLowerCase().includes(title.toLowerCase())
         );
 
-        // Buzz level based on consensus score rather than raw count
-        const buzzLevel = score?.isFrontrunner  ? "high"
-                        : score?.isConsensus    ? "high"
-                        : effectiveMentions >= 3 ? "medium"
-                        : windowBonus >= 2.0     ? "medium"  // fall release with any coverage
+        const buzzLevel = score?.isFrontrunner   ? "high"
+                        : score?.isConsensus     ? "high"
+                        : mentions >= 3          ? "medium"
+                        : windowBonus >= 2.0     ? "medium"
                         : "low";
 
         return {
           title,
-          director:        null,
-          cast:            [],
+          director:        enrichedFilm?.director ?? null,
+          topCast:         enrichedFilm?.topCast  ?? [],
+          genres:          enrichedFilm?.genres   ?? [],
           festival:        null,
           festivalSection: null,
           distributor:     null,
-          poster:          meta?.poster ?? null,
+          poster:          enrichedFilm?.poster ?? meta?.poster ?? null,
           releaseWindow:   releaseQuarter(meta?.releaseDate),
+          releaseDate:     meta?.releaseDate ?? null,
           buzzLevel,
           buzzSummary: score?.isFrontrunner
-            ? `Consensus frontrunner: ${score.predictingSites} prediction sites, ${effectiveMentions} articles`
+            ? `Consensus frontrunner: ${score.predictingSites} prediction sites, ${mentions} articles`
             : score?.isConsensus
             ? `Emerging consensus: ${score.predictingSites} sites tracking this film`
             : lead
             ? `"${lead.title.slice(0, 80)}" — ${lead.source}`
             : `${ELIGIBILITY_YEAR} Oscar-season film — campaigns building`,
-          oscarCategories: ["Best Picture", "Best Director"],
-          mentionCount:    effectiveMentions,
-          predictingSites: score?.predictingSites ?? 0,
-          isConsensus:     score?.isConsensus ?? false,
-          voteAverage:     meta?.voteAverage ?? 0,
+          oscarCategories:  ["Best Picture", "Best Director"],
+          mentionCount:     mentions,
+          predictingSites:  score?.predictingSites ?? 0,
+          isConsensus:      score?.isConsensus     ?? false,
+          voteAverage:      meta?.voteAverage ?? 0,
+          tmdbEnriched:     !!enrichedFilm?.director,
         };
       });
 
@@ -118,7 +125,7 @@ export async function POST(request) {
         predictionArticles: predArticles.length,
         sources:            activeSources,
         tmdbConfigured:     !!apiKey,
-        scoringModel:       "consensus-authority-weighted",
+        scoringModel:       "tmdb-credits + consensus-authority-weighted",
         fetchedAt:          new Date().toISOString(),
       });
     }
@@ -130,14 +137,22 @@ export async function POST(request) {
         .sort((a, b) => b[1].consensusScore - a[1].consensusScore)
         .slice(0, 8);
 
+      // Enrich top 5 with TMDB credits
+      const topForEnrich = topScored.slice(0, 5).map(([title]) => ({
+        title,
+        ...(catalogMap.get(title.toLowerCase()) ?? {}),
+      }));
+      const enriched = await enrichFilmsWithCredits(topForEnrich, ELIGIBILITY_YEAR, apiKey, 5);
+      const enrichMap = new Map(enriched.map((f) => [f.title, f]));
+
       let frontrunners;
       const maxScore = topScored[0]?.[1].consensusScore ?? 1;
 
       if (topScored.length >= 3) {
         const makeContenders = (mapper) =>
           topScored.slice(0, 5).map(([title, score]) => {
-            const name = mapper(title);
-            // Probability derived from relative consensus score, not arbitrary rank formula
+            const eFilm   = enrichMap.get(title);
+            const name    = mapper(title, eFilm);
             const basePct = Math.round((score.consensusScore / maxScore) * 80);
             const prob    = score.isFrontrunner ? Math.min(88, basePct + 10)
                           : score.isConsensus   ? Math.min(72, basePct)
@@ -149,31 +164,33 @@ export async function POST(request) {
               isConsensus:     score.isConsensus,
               isFrontrunner:   score.isFrontrunner,
               predictingSites: score.predictingSites,
+              poster:          eFilm?.poster ?? null,
             };
           });
 
         frontrunners = {
           bestPicture:           makeContenders((t) => t),
-          bestDirector:          makeContenders((t) => `Director of "${t}"`),
-          bestActor:             makeContenders((t) => `Lead actor in "${t}"`),
-          bestActress:           makeContenders((t) => `Lead actress in "${t}"`),
-          bestSupportingActor:   makeContenders((t) => `Supporting actor in "${t}"`),
-          bestSupportingActress: makeContenders((t) => `Supporting actress in "${t}"`),
+          bestDirector:          makeContenders((t, e) => e?.director ?? `Director of "${t}"`),
+          bestActor:             makeContenders((t, e) => e?.topMaleCast?.[0]   ? `${e.topMaleCast[0]} — ${t}`   : `Lead actor in "${t}"`),
+          bestActress:           makeContenders((t, e) => e?.topFemaleCast?.[0] ? `${e.topFemaleCast[0]} — ${t}` : `Lead actress in "${t}"`),
+          bestSupportingActor:   makeContenders((t, e) => e?.topMaleCast?.[1]   ? `${e.topMaleCast[1]} — ${t}`   : `Supporting actor in "${t}"`),
+          bestSupportingActress: makeContenders((t, e) => e?.topFemaleCast?.[1] ? `${e.topFemaleCast[1]} — ${t}` : `Supporting actress in "${t}"`),
         };
       } else {
-        // Sparse RSS — fall back to catalog with Oscar window bonus
-        const fb = catalog.slice(0, 5);
-        const makeC = (fn) => fb.map((f, i) => {
+        // Sparse RSS — fall back to TMDB catalog with Oscar window bonus
+        const fb    = catalog.slice(0, 5);
+        const fbEnr = await enrichFilmsWithCredits(fb, ELIGIBILITY_YEAR, apiKey, 5);
+        const makeC = (fn) => fbEnr.map((f, i) => {
           const wb = getOscarSeasonBonus(f.releaseDate, ELIGIBILITY_YEAR);
-          return { name: fn(f), title: fn(f), probability: Math.round((30 - i * 4) * (wb / 2)) };
+          return { name: fn(f), title: fn(f), probability: Math.round((30 - i * 4) * (wb / 2)), poster: f.poster ?? null };
         });
         frontrunners = {
           bestPicture:           makeC((f) => f.title),
-          bestDirector:          makeC((f) => `Director of "${f.title}"`),
-          bestActor:             makeC((f) => `Lead actor in "${f.title}"`),
-          bestActress:           makeC((f) => `Lead actress in "${f.title}"`),
-          bestSupportingActor:   makeC((f) => `Supporting actor in "${f.title}"`),
-          bestSupportingActress: makeC((f) => `Supporting actress in "${f.title}"`),
+          bestDirector:          makeC((f) => f.director ?? `Director of "${f.title}"`),
+          bestActor:             makeC((f) => f.topMaleCast?.[0]   ? `${f.topMaleCast[0]} — ${f.title}`   : `Lead actor in "${f.title}"`),
+          bestActress:           makeC((f) => f.topFemaleCast?.[0] ? `${f.topFemaleCast[0]} — ${f.title}` : `Lead actress in "${f.title}"`),
+          bestSupportingActor:   makeC((f) => f.topMaleCast?.[1]   ? `${f.topMaleCast[1]} — ${f.title}`   : `Supporting actor in "${f.title}"`),
+          bestSupportingActress: makeC((f) => f.topFemaleCast?.[1] ? `${f.topFemaleCast[1]} — ${f.title}` : `Supporting actress in "${f.title}"`),
         };
       }
 
@@ -183,17 +200,17 @@ export async function POST(request) {
         data: {
           season: `${ELIGIBILITY_YEAR}-${ELIGIBILITY_YEAR + 1}`,
           precursors: [
-            { name: "Telluride / Venice",  status: "upcoming", date: "September 2026", oscarCorrelation: "high" },
-            { name: "TIFF",                status: "upcoming", date: "September 2026", oscarCorrelation: "high" },
-            { name: "AFI Fest",            status: "upcoming", date: "October 2026",   oscarCorrelation: "medium" },
-            { name: "NYFF",                status: "upcoming", date: "October 2026",   oscarCorrelation: "medium" },
-            { name: "Golden Globes",       status: "upcoming", date: "January 2027",   oscarCorrelation: "high" },
-            { name: "Critics Choice",      status: "upcoming", date: "January 2027",   oscarCorrelation: "high" },
+            { name: "Telluride / Venice",  status: "upcoming", date: "September 2026", oscarCorrelation: "high"      },
+            { name: "TIFF",                status: "upcoming", date: "September 2026", oscarCorrelation: "high"      },
+            { name: "AFI Fest",            status: "upcoming", date: "October 2026",   oscarCorrelation: "medium"    },
+            { name: "NYFF",                status: "upcoming", date: "October 2026",   oscarCorrelation: "medium"    },
+            { name: "Golden Globes",       status: "upcoming", date: "January 2027",   oscarCorrelation: "high"      },
+            { name: "Critics Choice",      status: "upcoming", date: "January 2027",   oscarCorrelation: "high"      },
             { name: "SAG Awards",          status: "upcoming", date: "February 2027",  oscarCorrelation: "very high" },
             { name: "DGA Awards",          status: "upcoming", date: "February 2027",  oscarCorrelation: "very high" },
-            { name: "PGA Awards",          status: "upcoming", date: "February 2027",  oscarCorrelation: "high" },
-            { name: "BAFTA",               status: "upcoming", date: "February 2027",  oscarCorrelation: "high" },
-            { name: "WGA Awards",          status: "upcoming", date: "February 2027",  oscarCorrelation: "medium" },
+            { name: "PGA Awards",          status: "upcoming", date: "February 2027",  oscarCorrelation: "high"      },
+            { name: "BAFTA",               status: "upcoming", date: "February 2027",  oscarCorrelation: "high"      },
+            { name: "WGA Awards",          status: "upcoming", date: "February 2027",  oscarCorrelation: "medium"    },
           ],
           frontrunners,
         },
@@ -201,7 +218,7 @@ export async function POST(request) {
         predictionArticles: predArticles.length,
         sources:            activeSources,
         tmdbConfigured:     !!apiKey,
-        scoringModel:       "consensus-authority-weighted",
+        scoringModel:       "tmdb-credits + consensus-authority-weighted",
         fetchedAt:          new Date().toISOString(),
       });
     }
