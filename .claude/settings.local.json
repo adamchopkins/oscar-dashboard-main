@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "PowerShell(cd \"c:\\\\Users\\\\Samsu\\\\OneDrive\\\\Desktop\\\\oscar-tracker\\\\oscar-dashboard-main\"; $files = @\\(\"src/lib/tmdb.js\",\"src/lib/oscarFeeds.js\",\"src/app/api/pipeline/route.js\",\"src/app/api/oscar-predictions/route.js\",\"src/app/api/festival-intel/route.js\"\\); $ok = $true; foreach \\($f in $files\\) { $result = node --check $f 2>&1; if \\($LASTEXITCODE -ne 0\\) { Write-Output \"FAIL: $f — $result\"; $ok = $false } else { Write-Output \"OK:   $f\" } }; if \\($ok\\) { Write-Output \"`nAll files pass syntax check.\" })"
+      "PowerShell(cd \"c:\\\\Users\\\\Samsu\\\\OneDrive\\\\Desktop\\\\oscar-tracker\\\\oscar-dashboard-main\"; $files = @\\(\"src/lib/tmdb.js\",\"src/lib/oscarFeeds.js\",\"src/app/api/pipeline/route.js\",\"src/app/api/oscar-predictions/route.js\",\"src/app/api/festival-intel/route.js\"\\); $ok = $true; foreach \\($f in $files\\) { $result = node --check $f 2>&1; if \\($LASTEXITCODE -ne 0\\) { Write-Output \"FAIL: $f — $result\"; $ok = $false } else { Write-Output \"OK:   $f\" } }; if \\($ok\\) { Write-Output \"`nAll files pass syntax check.\" })",
+      "PowerShell(cd \"c:\\\\Users\\\\Samsu\\\\OneDrive\\\\Desktop\\\\oscar-tracker\\\\oscar-dashboard-main\"; $files = @\\(\"src/lib/penskeFeeds.js\",\"src/lib/oscarFeeds.js\",\"src/lib/tmdb.js\",\"src/app/api/pipeline/route.js\",\"src/app/api/oscar-predictions/route.js\",\"src/app/api/festival-intel/route.js\"\\); $ok = $true; foreach \\($f in $files\\) { $result = node --check $f 2>&1; if \\($LASTEXITCODE -ne 0\\) { Write-Output \"FAIL: $f`n  $result\"; $ok = $false } else { Write-Output \"OK:   $f\" } }; if \\($ok\\) { Write-Output \"`nAll 6 files pass syntax check.\" })"
     ]
   }
 }

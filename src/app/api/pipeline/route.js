@@ -1,20 +1,22 @@
 // Pipeline — live 2026 film slate.
 //
-// Primary source:  TMDB via getTMDBPipelineFilms (TMDB_API_KEY required)
-//                  Queries prestige dramas, upcoming fall releases, and popular films —
-//                  Oscar-season (Sep–Dec) films surface first.
-// Fallback source: Wikipedia MediaWiki API (no key needed)
-// Buzz overlay:    11 RSS feeds — Oscar mention count used to re-rank within the TMDB slate.
+// Primary catalog:  TMDB via getTMDBPipelineFilms (requires TMDB_API_KEY)
+//                   Prestige dramas + upcoming fall/Q4 releases surface first.
+// Fallback catalog: PMC-mentioned films from scrapePMCPredictions — if TMDB key
+//                   is absent, the films PMC prediction sites are already discussing
+//                   are real 2026 contenders and serve as a viable catalog.
+// Buzz overlay:     Non-PMC prediction feeds (Gold Derby, NBP, etc.) used to score
+//                   Oscar mentions. PMC scoring is handled separately via penskeFeeds.
 
 import { NextResponse } from "next/server";
 import { getTMDBPipelineFilms } from "@/lib/tmdb";
+import { scrapePMCPredictions, getAllPMCFilms } from "@/lib/penskeFeeds";
 import {
   PREDICTION_FEEDS,
   fetchFeed,
   filterOscarArticles,
   countMentions,
   getOscarSeasonBonus,
-  getWikipediaFilms,
 } from "@/lib/oscarFeeds";
 
 export async function GET(request) {
@@ -23,46 +25,78 @@ export async function GET(request) {
   const apiKey = process.env.TMDB_API_KEY;
 
   try {
-    // TMDB catalog + live RSS buzz — parallel
-    const [tmdbFilms, feedResults] = await Promise.all([
+    // TMDB catalog + PMC scrape + secondary RSS — all parallel
+    const [tmdbFilms, pmcResult, feedResults] = await Promise.all([
       apiKey ? getTMDBPipelineFilms(year, apiKey) : null,
+      scrapePMCPredictions(year),
       Promise.all(PREDICTION_FEEDS.map(fetchFeed)),
     ]);
 
-    const movies = tmdbFilms ?? await getWikipediaFilms(year);
+    // Build film catalog: TMDB first, PMC-mentioned films as fallback
+    let movies = tmdbFilms;
+    let source = "TMDB";
 
     if (!movies?.length) {
-      return NextResponse.json(
-        { success: false, error: "No film data available. Check TMDB_API_KEY or network." },
-        { status: 503 }
-      );
+      // No TMDB key — use films PMC outlets are already predicting as the catalog
+      const pmcFilms = getAllPMCFilms(pmcResult);
+      if (!pmcFilms.length) {
+        return NextResponse.json(
+          { success: false, error: "No film data available. Add TMDB_API_KEY or check network." },
+          { status: 503 }
+        );
+      }
+      movies = pmcFilms.map((title, i) => ({
+        id: i + 1, title, releaseDate: null, overview: "",
+        poster: null, popularity: pmcFilms.length - i, voteAverage: 0,
+      }));
+      source = "PMC prediction sites";
     }
 
-    // Oscar buzz from RSS
-    const oscarArticles = filterOscarArticles(feedResults.flat());
-    const activeSources = PREDICTION_FEEDS
+    // Oscar buzz from non-PMC prediction feeds
+    const oscarArticles  = filterOscarArticles(feedResults.flat());
+    const activeSources  = PREDICTION_FEEDS
       .filter((_, i) => feedResults[i].length > 0)
       .map((f) => f.name);
+    // Also include PMC outlets that returned data
+    const allActiveSources = [...new Set([...pmcResult.activeSources, ...activeSources])];
 
-    // Score: Oscar mentions + Oscar season release window bonus
+    // PMC prediction scores (if a film appears in PMC Best Picture predictions, boost it)
+    const pmcScoreMap = new Map(
+      (pmcResult.predictions.bestPicture ?? []).map((p, i) => [
+        p.name.toLowerCase(),
+        { pmcScore: p.score, pmcRank: i },
+      ])
+    );
+
+    // Score each film
     const scored = movies
       .map((m) => {
-        const mentions      = countMentions(oscarArticles, m.title);
+        const rssMentions   = countMentions(oscarArticles, m.title);
         const windowBonus   = getOscarSeasonBonus(m.releaseDate, year);
-        // Combined score keeps Oscar-season prestige films above general blockbusters
-        const score         = mentions * 10 + windowBonus * (m.popularity / 5);
-        return { ...m, oscarMentions: mentions, oscarSeasonRelease: windowBonus >= 2.0, score };
+        const pmcEntry      = pmcScoreMap.get(m.title.toLowerCase());
+        const pmcBoost      = pmcEntry ? (pmcEntry.pmcScore * 2) : 0;
+        // Combined score: PMC prediction data + RSS buzz + Oscar-season window
+        const score = pmcBoost + rssMentions * 10 + windowBonus * (m.popularity / 5);
+        return {
+          ...m,
+          oscarMentions:     rssMentions,
+          pmcPredicted:      !!pmcEntry,
+          pmcRank:           pmcEntry?.pmcRank ?? null,
+          oscarSeasonRelease: windowBonus >= 2.0,
+          score,
+        };
       })
       .sort((a, b) => b.score - a.score || b.popularity - a.popularity)
-      .map(({ score, ...film }) => film); // Drop internal score from response
+      .map(({ score, ...film }) => film);
 
     return NextResponse.json({
       success:         true,
       year,
       count:           scored.length,
       movies:          scored,
-      source:          apiKey ? "TMDB" : "Wikipedia",
-      buzzSources:     activeSources,
+      source,
+      pmcSources:      pmcResult.activeSources,
+      buzzSources:     allActiveSources,
       articlesScanned: oscarArticles.length,
       tmdbConfigured:  !!apiKey,
     });

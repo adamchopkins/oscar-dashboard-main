@@ -1,14 +1,13 @@
-// Festival Intelligence & Precursor Awards — TMDB-first, consensus-scored.
+// Festival Intelligence & Precursor Awards — PMC-primary, TMDB-enriched.
 //
-// Film data:     TMDB getTMDBOscarContenders (primary) — Wikipedia fallback if no key
-// Enrichment:    enrichFilmsWithCredits adds director + cast to top festival contenders
-// Scoring:       Same consensus model as oscar-predictions
+// Primary source: scrapePMCPredictions — Variety + Deadline + IndieWire + THR
+//                 Extracts category predictions from both RSS feeds and award pages.
+// Enrichment:     enrichFilmsWithCredits adds real director/cast to top contenders.
+// Secondary:      Non-PMC prediction feed RSS for consensus verification.
 
 import { NextResponse } from "next/server";
-import {
-  getTMDBOscarContenders,
-  enrichFilmsWithCredits,
-} from "@/lib/tmdb";
+import { getTMDBOscarContenders, enrichFilmsWithCredits } from "@/lib/tmdb";
+import { scrapePMCPredictions } from "@/lib/penskeFeeds";
 import {
   PREDICTION_FEEDS,
   fetchFeed,
@@ -17,23 +16,27 @@ import {
   extractFilmTitles,
   computeConsensusScore,
   getOscarSeasonBonus,
-  getWikipediaFilms,
   releaseQuarter,
 } from "@/lib/oscarFeeds";
 
 export async function POST(request) {
   try {
     const { query_type = "festivals" } = await request.json();
-    const apiKey            = process.env.TMDB_API_KEY;
-    const ELIGIBILITY_YEAR  = 2026;
+    const apiKey           = process.env.TMDB_API_KEY;
+    const ELIGIBILITY_YEAR = 2026;
 
-    const [feedResults, tmdbCatalog] = await Promise.all([
+    // All sources in parallel
+    const [pmcResult, feedResults, tmdbCatalog] = await Promise.all([
+      scrapePMCPredictions(ELIGIBILITY_YEAR),
       Promise.all(PREDICTION_FEEDS.map(fetchFeed)),
       apiKey ? getTMDBOscarContenders(ELIGIBILITY_YEAR, apiKey) : null,
     ]);
 
-    const catalog = tmdbCatalog ?? await getWikipediaFilms(ELIGIBILITY_YEAR);
+    // Film catalog: TMDB is authoritative metadata source
+    const catalog    = tmdbCatalog ?? [];
+    const catalogMap = new Map(catalog.map((f) => [f.title.toLowerCase(), f]));
 
+    // Secondary RSS for consensus verification
     const allArticles   = feedResults.flat();
     const oscarArticles = filterOscarArticles(allArticles);
     const predArticles  = filterPredictionArticles(allArticles).filter(
@@ -42,78 +45,82 @@ export async function POST(request) {
     const activeSources = PREDICTION_FEEDS
       .filter((_, i) => feedResults[i].length > 0)
       .map((f) => f.name);
+    const allActiveSources = [...new Set([...pmcResult.activeSources, ...activeSources])];
 
-    const allTitles = [...new Set([
+    // PMC Best Picture list is the primary ranked film list
+    const pmcBP = pmcResult.predictions.bestPicture ?? [];
+
+    // Build unified ranked title list: PMC first, then RSS consensus, then TMDB gap-fill
+    const pmcSet = new Set(pmcBP.map((p) => p.name));
+    const rssTitles = new Set([
       ...extractFilmTitles(predArticles.map((a) => a.title + " " + a.description).join(" ")),
       ...extractFilmTitles(oscarArticles.map((a) => a.title + " " + a.description).join(" ")),
-    ])];
+    ]);
+    const rssOnly    = [...rssTitles].filter((t) => !pmcSet.has(t));
+    const tmdbOnly   = catalog.map((f) => f.title).filter((t) => !pmcSet.has(t) && !rssTitles.has(t));
+    const allRanked  = [...pmcBP.map((p) => p.name), ...rssOnly, ...tmdbOnly];
 
-    const titleScores = new Map(
-      allTitles.map((t) => [t, computeConsensusScore(oscarArticles, predArticles, t)])
+    // Consensus scores for RSS-sourced titles (used as secondary signal)
+    const rssScores = new Map(
+      [...rssTitles].map((t) => [t, computeConsensusScore(oscarArticles, predArticles, t)])
     );
 
-    const catalogMap = new Map(catalog.map((f) => [f.title.toLowerCase(), f]));
-
-    // Sorted by consensus score descending, TMDB catalog as gap-fill
-    const rssRanked  = [...titleScores.entries()]
-      .filter(([, s]) => s.rawMentions > 0)
-      .sort((a, b) => b[1].consensusScore - a[1].consensusScore)
-      .map(([t]) => t);
-    const catalogOnly = catalog.map((f) => f.title).filter((t) => !titleScores.has(t));
-    const allRanked   = [...new Set([...rssRanked, ...catalogOnly])];
-
-    // ── FESTIVALS ──────────────────────────────────────────────────────────
+    // ── FESTIVALS ─────────────────────────────────────────────────────────────
     if (query_type === "festivals") {
-      // Enrich top 8 with TMDB credits for director/cast info
-      const topForEnrichment = allRanked.slice(0, 8).map((title) => ({
-        title,
-        ...(catalogMap.get(title.toLowerCase()) ?? {}),
+      // Enrich top 8 titles with TMDB credits
+      const topForEnrich = allRanked.slice(0, 8).map((title) => ({
+        title, ...(catalogMap.get(title.toLowerCase()) ?? {}),
       }));
-      const enriched    = await enrichFilmsWithCredits(topForEnrichment, ELIGIBILITY_YEAR, apiKey, 8);
+      const enriched    = await enrichFilmsWithCredits(topForEnrich, ELIGIBILITY_YEAR, apiKey, 8);
       const enrichedMap = new Map(enriched.map((f) => [f.title, f]));
 
-      const films = allRanked.slice(0, 20).map((title) => {
-        const meta        = catalogMap.get(title.toLowerCase());
-        const score       = titleScores.get(title);
-        const enrichedFilm = enrichedMap.get(title);
+      const films = allRanked.slice(0, 20).map((title, i) => {
+        const meta       = catalogMap.get(title.toLowerCase());
+        const ef         = enrichedMap.get(title);
+        const pmcEntry   = pmcBP.find((p) => p.name === title);
+        const rssScore   = rssScores.get(title);
         const windowBonus = getOscarSeasonBonus(meta?.releaseDate ?? null, ELIGIBILITY_YEAR);
-        const mentions    = score?.rawMentions ?? 0;
+
+        // Buzz level: PMC frontrunner status > RSS consensus > window bonus
+        const buzzLevel = (pmcEntry && i < 3)        ? "high"
+                        : pmcEntry                    ? "high"
+                        : rssScore?.isFrontrunner     ? "high"
+                        : rssScore?.isConsensus       ? "medium"
+                        : windowBonus >= 2.0          ? "medium"
+                        : "low";
 
         const lead = oscarArticles.find((a) =>
           (a.title + " " + a.description).toLowerCase().includes(title.toLowerCase())
         );
 
-        const buzzLevel = score?.isFrontrunner   ? "high"
-                        : score?.isConsensus     ? "high"
-                        : mentions >= 3          ? "medium"
-                        : windowBonus >= 2.0     ? "medium"
-                        : "low";
-
         return {
           title,
-          director:        enrichedFilm?.director ?? null,
-          topCast:         enrichedFilm?.topCast  ?? [],
-          genres:          enrichedFilm?.genres   ?? [],
+          director:        ef?.director  ?? null,
+          topCast:         ef?.topCast   ?? [],
+          genres:          ef?.genres    ?? [],
           festival:        null,
           festivalSection: null,
           distributor:     null,
-          poster:          enrichedFilm?.poster ?? meta?.poster ?? null,
+          poster:          ef?.poster ?? meta?.poster ?? null,
           releaseWindow:   releaseQuarter(meta?.releaseDate),
           releaseDate:     meta?.releaseDate ?? null,
           buzzLevel,
-          buzzSummary: score?.isFrontrunner
-            ? `Consensus frontrunner: ${score.predictingSites} prediction sites, ${mentions} articles`
-            : score?.isConsensus
-            ? `Emerging consensus: ${score.predictingSites} sites tracking this film`
+          buzzSummary: pmcEntry
+            ? `PMC consensus pick — ${pmcResult.activeSources.join(", ")}`
+            : rssScore?.isFrontrunner
+            ? `Consensus frontrunner: ${rssScore.predictingSites} prediction sites`
+            : rssScore?.isConsensus
+            ? `Emerging consensus: ${rssScore.predictingSites} sites tracking`
             : lead
             ? `"${lead.title.slice(0, 80)}" — ${lead.source}`
-            : `${ELIGIBILITY_YEAR} Oscar-season film — campaigns building`,
+            : `${ELIGIBILITY_YEAR} Oscar-season release`,
           oscarCategories:  ["Best Picture", "Best Director"],
-          mentionCount:     mentions,
-          predictingSites:  score?.predictingSites ?? 0,
-          isConsensus:      score?.isConsensus     ?? false,
+          pmcPredicted:     !!pmcEntry,
+          pmcScore:         pmcEntry?.score ?? 0,
+          predictingSites:  rssScore?.predictingSites ?? 0,
+          isConsensus:      !!pmcEntry || rssScore?.isConsensus || false,
           voteAverage:      meta?.voteAverage ?? 0,
-          tmdbEnriched:     !!enrichedFilm?.director,
+          tmdbEnriched:     !!ef?.director,
         };
       });
 
@@ -121,78 +128,67 @@ export async function POST(request) {
         success:            true,
         queryType:          "festivals",
         data:               films,
+        pmcSources:         pmcResult.activeSources,
+        secondarySources:   activeSources,
+        allSources:         allActiveSources,
+        pmcArticles:        pmcResult.sources.filter((s) => s.fetched).length,
         articlesScanned:    oscarArticles.length,
-        predictionArticles: predArticles.length,
-        sources:            activeSources,
         tmdbConfigured:     !!apiKey,
-        scoringModel:       "tmdb-credits + consensus-authority-weighted",
+        dataSource:         pmcBP.length >= 3 ? "PMC-primary" : "RSS-fallback",
         fetchedAt:          new Date().toISOString(),
       });
     }
 
-    // ── PRECURSORS ─────────────────────────────────────────────────────────
+    // ── PRECURSORS ────────────────────────────────────────────────────────────
     if (query_type === "precursors") {
-      const topScored = [...titleScores.entries()]
-        .filter(([, s]) => s.rawMentions > 0)
-        .sort((a, b) => b[1].consensusScore - a[1].consensusScore)
-        .slice(0, 8);
-
-      // Enrich top 5 with TMDB credits
-      const topForEnrich = topScored.slice(0, 5).map(([title]) => ({
-        title,
-        ...(catalogMap.get(title.toLowerCase()) ?? {}),
+      // Top 5 films for enrichment — PMC BP list or RSS fallback
+      const top5Titles = allRanked.slice(0, 5);
+      const top5Films  = top5Titles.map((title) => ({
+        title, ...(catalogMap.get(title.toLowerCase()) ?? {}),
       }));
-      const enriched = await enrichFilmsWithCredits(topForEnrich, ELIGIBILITY_YEAR, apiKey, 5);
+      const enriched = await enrichFilmsWithCredits(top5Films, ELIGIBILITY_YEAR, apiKey, 5);
       const enrichMap = new Map(enriched.map((f) => [f.title, f]));
 
-      let frontrunners;
-      const maxScore = topScored[0]?.[1].consensusScore ?? 1;
+      // Score for probability: PMC score (primary) or RSS consensus (fallback)
+      const pmcMax = pmcBP[0]?.score ?? 1;
+      const getProb = (title, rank) => {
+        const pmcEntry = pmcBP.find((p) => p.name === title);
+        if (pmcEntry) {
+          const base = Math.round((pmcEntry.score / pmcMax) * 80);
+          return Math.min(88, rank === 0 ? base + 8 : rank < 3 ? base + 3 : base);
+        }
+        const rs = rssScores.get(title);
+        if (rs) {
+          const base = Math.round((rs.consensusScore / Math.max(...[...rssScores.values()].map((s) => s.consensusScore), 1)) * 70);
+          return Math.min(72, base);
+        }
+        return Math.max(8, 28 - rank * 5);
+      };
 
-      if (topScored.length >= 3) {
-        const makeContenders = (mapper) =>
-          topScored.slice(0, 5).map(([title, score]) => {
-            const eFilm   = enrichMap.get(title);
-            const name    = mapper(title, eFilm);
-            const basePct = Math.round((score.consensusScore / maxScore) * 80);
-            const prob    = score.isFrontrunner ? Math.min(88, basePct + 10)
-                          : score.isConsensus   ? Math.min(72, basePct)
-                          : Math.min(55, basePct - 5);
-            return {
-              name,
-              title: name,
-              probability:     Math.max(8, prob),
-              isConsensus:     score.isConsensus,
-              isFrontrunner:   score.isFrontrunner,
-              predictingSites: score.predictingSites,
-              poster:          eFilm?.poster ?? null,
-            };
-          });
-
-        frontrunners = {
-          bestPicture:           makeContenders((t) => t),
-          bestDirector:          makeContenders((t, e) => e?.director ?? `Director of "${t}"`),
-          bestActor:             makeContenders((t, e) => e?.topMaleCast?.[0]   ? `${e.topMaleCast[0]} — ${t}`   : `Lead actor in "${t}"`),
-          bestActress:           makeContenders((t, e) => e?.topFemaleCast?.[0] ? `${e.topFemaleCast[0]} — ${t}` : `Lead actress in "${t}"`),
-          bestSupportingActor:   makeContenders((t, e) => e?.topMaleCast?.[1]   ? `${e.topMaleCast[1]} — ${t}`   : `Supporting actor in "${t}"`),
-          bestSupportingActress: makeContenders((t, e) => e?.topFemaleCast?.[1] ? `${e.topFemaleCast[1]} — ${t}` : `Supporting actress in "${t}"`),
-        };
-      } else {
-        // Sparse RSS — fall back to TMDB catalog with Oscar window bonus
-        const fb    = catalog.slice(0, 5);
-        const fbEnr = await enrichFilmsWithCredits(fb, ELIGIBILITY_YEAR, apiKey, 5);
-        const makeC = (fn) => fbEnr.map((f, i) => {
-          const wb = getOscarSeasonBonus(f.releaseDate, ELIGIBILITY_YEAR);
-          return { name: fn(f), title: fn(f), probability: Math.round((30 - i * 4) * (wb / 2)), poster: f.poster ?? null };
+      const makeContenders = (catKey, nameFn) => {
+        const pmcList = pmcResult.predictions[catKey] ?? [];
+        return top5Titles.map((title, i) => {
+          const ef   = enrichMap.get(title);
+          const pmcEntry = pmcList[i];
+          const name = pmcEntry?.name ?? nameFn(title, ef);
+          return {
+            name,
+            title:           name,
+            probability:     getProb(title, i),
+            pmcPredicted:    !!pmcEntry,
+            poster:          ef?.poster ?? null,
+          };
         });
-        frontrunners = {
-          bestPicture:           makeC((f) => f.title),
-          bestDirector:          makeC((f) => f.director ?? `Director of "${f.title}"`),
-          bestActor:             makeC((f) => f.topMaleCast?.[0]   ? `${f.topMaleCast[0]} — ${f.title}`   : `Lead actor in "${f.title}"`),
-          bestActress:           makeC((f) => f.topFemaleCast?.[0] ? `${f.topFemaleCast[0]} — ${f.title}` : `Lead actress in "${f.title}"`),
-          bestSupportingActor:   makeC((f) => f.topMaleCast?.[1]   ? `${f.topMaleCast[1]} — ${f.title}`   : `Supporting actor in "${f.title}"`),
-          bestSupportingActress: makeC((f) => f.topFemaleCast?.[1] ? `${f.topFemaleCast[1]} — ${f.title}` : `Supporting actress in "${f.title}"`),
-        };
-      }
+      };
+
+      const frontrunners = {
+        bestPicture:           makeContenders("bestPicture",           (t)    => t),
+        bestDirector:          makeContenders("bestDirector",          (t, e) => e?.director ?? `Director of "${t}"`),
+        bestActor:             makeContenders("bestActor",             (t, e) => e?.topMaleCast?.[0]   ? `${e.topMaleCast[0]} — ${t}`   : `Lead actor in "${t}"`),
+        bestActress:           makeContenders("bestActress",           (t, e) => e?.topFemaleCast?.[0] ? `${e.topFemaleCast[0]} — ${t}` : `Lead actress in "${t}"`),
+        bestSupportingActor:   makeContenders("bestSupportingActor",   (t, e) => e?.topMaleCast?.[1]   ? `${e.topMaleCast[1]} — ${t}`   : `Supporting actor in "${t}"`),
+        bestSupportingActress: makeContenders("bestSupportingActress", (t, e) => e?.topFemaleCast?.[1] ? `${e.topFemaleCast[1]} — ${t}` : `Supporting actress in "${t}"`),
+      };
 
       return NextResponse.json({
         success:   true,
@@ -214,12 +210,13 @@ export async function POST(request) {
           ],
           frontrunners,
         },
-        articlesScanned:    oscarArticles.length,
-        predictionArticles: predArticles.length,
-        sources:            activeSources,
-        tmdbConfigured:     !!apiKey,
-        scoringModel:       "tmdb-credits + consensus-authority-weighted",
-        fetchedAt:          new Date().toISOString(),
+        pmcSources:      pmcResult.activeSources,
+        secondarySources: activeSources,
+        pmcArticles:     pmcResult.sources.filter((s) => s.fetched).length,
+        articlesScanned: oscarArticles.length,
+        tmdbConfigured:  !!apiKey,
+        dataSource:      pmcBP.length >= 3 ? "PMC-primary" : "RSS-fallback",
+        fetchedAt:       new Date().toISOString(),
       });
     }
 

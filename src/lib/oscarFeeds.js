@@ -1,104 +1,23 @@
-// Oscar RSS + scoring — no API key required.
-// TMDB film catalog is in @/lib/tmdb (requires TMDB_API_KEY).
-// Wikipedia is the no-key fallback when TMDB is unavailable.
+// Secondary prediction feed scoring — non-PMC aggregators & specialists.
+// PMC outlets (Variety, Deadline, IndieWire, THR) are handled by @/lib/penskeFeeds.
+// Wikipedia has been removed; TMDB is the film data source (@/lib/tmdb).
 //
 // Scoring model:
 //   Site authority × prediction-article weight × cross-site consensus multiplier
-//   Oscar season window (Jul–Dec): release bonus applied on top
+//   Oscar season window (Jul–Dec): release bonus applied on top.
 
-// ─── Wikipedia fallback (no API key) ─────────────────────────────────────────
-
-const WIKI_API = "https://en.wikipedia.org/w/api.php";
-
-export async function getWikipediaFilms(year) {
-  try {
-    const catParams = new URLSearchParams({
-      action: "query", list: "categorymembers",
-      cmtitle: `Category:${year}_films`, cmlimit: "50", format: "json",
-    });
-    const catRes = await fetch(`${WIKI_API}?${catParams}`, {
-      headers: { "User-Agent": "OscarDashboard/1.0" }, cache: "no-store",
-    });
-    if (!catRes.ok) return [];
-
-    const members = ((await catRes.json()).query?.categorymembers ?? [])
-      .filter((m) => m.ns === 0)
-      .slice(0, 30);
-    if (!members.length) return [];
-
-    const titlesStr = members.map((m) => encodeURIComponent(m.title)).join("|");
-    const propParams = new URLSearchParams({
-      action: "query", prop: "extracts|pageimages",
-      exintro: "1", exsentences: "2",
-      piprop: "thumbnail", pithumbsize: "342", format: "json",
-    });
-    const propRes = await fetch(`${WIKI_API}?${propParams}&titles=${titlesStr}`, {
-      headers: { "User-Agent": "OscarDashboard/1.0" }, cache: "no-store",
-    });
-
-    if (!propRes.ok) {
-      return members.map((m, i) => ({
-        id: m.pageid ?? i + 1, title: cleanWikiTitle(m.title),
-        releaseDate: null, overview: "", poster: null, popularity: 30 - i, voteAverage: 0,
-      }));
-    }
-
-    return Object.values((await propRes.json()).query?.pages ?? {})
-      .filter((p) => p.pageid > 0)
-      .map((p, i) => ({
-        id: p.pageid, title: cleanWikiTitle(p.title),
-        releaseDate: extractWikiDate(p.extract ?? ""),
-        overview: wikiText(p.extract ?? "").slice(0, 200),
-        poster: p.thumbnail?.source ?? null,
-        popularity: 30 - i, voteAverage: 0,
-      }));
-  } catch { return []; }
-}
-
-function cleanWikiTitle(t) {
-  return t.replace(/\s*\([^)]*(?:film|movie)[^)]*\)\s*$/i, "").trim();
-}
-
-const MONTH_MAP = {
-  january:"01",february:"02",march:"03",april:"04",may:"05",june:"06",
-  july:"07",august:"08",september:"09",october:"10",november:"11",december:"12",
-};
-const DATE_RE = /\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(20\d{2})\b/i;
-
-function extractWikiDate(html) {
-  const m = wikiText(html).match(DATE_RE);
-  if (!m) return null;
-  return `${m[3]}-${MONTH_MAP[m[1].toLowerCase()]}-${m[2].padStart(2, "0")}`;
-}
-
-function wikiText(html) {
-  return html
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&amp;/g,"&").replace(/&lt;/g,"<").replace(/&gt;/g,">")
-    .replace(/&nbsp;/g," ").replace(/&#(\d+);/g,(_,c)=>String.fromCharCode(+c))
-    .replace(/\s+/g," ").trim();
-}
-
-// ─── RSS Feed Sources with authority weights ──────────────────────────────────
-// Authority tiers:
-//   3.0 — dedicated prediction aggregators (Gold Derby tracks consensus across hundreds of experts)
-//   2.5 — prediction-specialist sites (season-long tracking)
-//   2.0 — major prediction-focused trade columns
-//   1.8 — major trade publications with dedicated awards beats
-//   1.5 — awards newsletters / broad entertainment with awards coverage
+// ─── Non-PMC prediction feeds ─────────────────────────────────────────────────
+// These are dedicated prediction aggregators and specialist sites.
+// PMC outlets are intentionally excluded here — they're fetched with richer scraping
+// in penskeFeeds.js which also reads their full prediction pages, not just RSS.
 
 export const PREDICTION_FEEDS = [
-  { name: "Gold Derby",          url: "https://www.goldderby.com/feed/",                      authority: 3.0 },
-  { name: "Next Best Picture",   url: "https://nextbestpicture.com/feed/",                    authority: 2.5 },
-  { name: "Awards Circuit",      url: "https://www.awardscircuit.com/feed/",                  authority: 2.5 },
-  { name: "AwardsWatch",         url: "https://awardswatch.com/feed/",                        authority: 2.0 },
-  { name: "Variety Awards",      url: "https://variety.com/v/film/awards-intelligence/feed/", authority: 2.0 },
-  { name: "Deadline Awards",     url: "https://deadline.com/category/awardsline/feed/",       authority: 1.8 },
-  { name: "Hollywood Reporter",  url: "https://www.hollywoodreporter.com/feed/",              authority: 1.8 },
-  { name: "IndieWire Oscars",    url: "https://www.indiewire.com/tag/oscars/feed/",           authority: 1.8 },
-  { name: "The Wrap Awards",     url: "https://www.thewrap.com/awards/feed/",                 authority: 1.5 },
-  { name: "The Ankler",          url: "https://www.theankler.com/feed",                       authority: 1.5 },
-  { name: "Entertainment Weekly",url: "https://ew.com/tag/oscars/feed/",                      authority: 1.2 },
+  { name: "Gold Derby",          url: "https://www.goldderby.com/feed/",               authority: 3.0 },
+  { name: "Next Best Picture",   url: "https://nextbestpicture.com/feed/",             authority: 2.5 },
+  { name: "Awards Circuit",      url: "https://www.awardscircuit.com/feed/",           authority: 2.5 },
+  { name: "AwardsWatch",         url: "https://awardswatch.com/feed/",                 authority: 2.0 },
+  { name: "The Ankler",          url: "https://www.theankler.com/feed",                authority: 1.5 },
+  { name: "Entertainment Weekly",url: "https://ew.com/tag/oscars/feed/",               authority: 1.2 },
 ];
 
 // ─── RSS Fetching & Parsing ───────────────────────────────────────────────────
@@ -133,14 +52,14 @@ function parseRSS(xml, source) {
 function getTag(xml, tag) {
   const cd = xml.match(new RegExp(`<${tag}[^>]*>\\s*<!\\[CDATA\\[([\\s\\S]*?)\\]\\]>`, "i"));
   if (cd) return deEnt(cd[1].trim());
-  const pl = xml.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)</${tag}>`, "i"));
+  const pl = xml.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i"));
   return pl ? deEnt(pl[1].trim()) : "";
 }
 
 function deEnt(t) {
   return t
-    .replace(/&ldquo;|&#8220;/g,"“").replace(/&rdquo;|&#8221;/g,"”")
-    .replace(/&lsquo;|&#8216;/g,"‘").replace(/&rsquo;|&#8217;/g,"’")
+    .replace(/&ldquo;|&#8220;/g,'"').replace(/&rdquo;|&#8221;/g,'"')
+    .replace(/&lsquo;|&#8216;/g,"'").replace(/&rsquo;|&#8217;/g,"'")
     .replace(/&amp;/g,"&").replace(/&lt;/g,"<").replace(/&gt;/g,">")
     .replace(/&nbsp;/g," ").replace(/&#(\d+);/g,(_,c)=>String.fromCharCode(+c));
 }
@@ -156,7 +75,6 @@ export function filterOscarArticles(articles) {
   );
 }
 
-// Stricter filter — targets articles specifically making predictions, not just general coverage
 export function filterPredictionArticles(articles) {
   return articles.filter((a) =>
     /oscar|academy award|best picture|awards season|frontrunner|campaign|fyc|99th|guild|awards race/i
@@ -170,9 +88,8 @@ export function isPredictionArticle(article) {
 }
 
 // ─── Consensus Scoring ────────────────────────────────────────────────────────
-// Long-term signal: prediction-article mentions are weighted 2.5× over general buzz.
-// Cross-site agreement is the strongest durable predictor — independent picks from
-// 4+ Gold Derby / NBP / Awards Circuit tier sites are far more reliable than raw counts.
+// Long-term signal: prediction-article mentions weighted 2.5× over general buzz.
+// Cross-site agreement is the strongest durable predictor.
 
 export function computeConsensusScore(allArticles, predictionArticles, title) {
   const lower   = title.toLowerCase();
@@ -208,9 +125,6 @@ export function computeConsensusScore(allArticles, predictionArticles, title) {
 }
 
 // ─── Oscar Season Release Bonus ───────────────────────────────────────────────
-// Fall/winter releases carry more long-term Oscar weight — studios run FYC campaigns
-// and guild screenings Sep–Jan. A film confirmed for Nov release has more durable
-// Oscar potential than the same film with unknown or early-year release.
 
 export function getOscarSeasonBonus(dateStr, eligibilityYear) {
   if (!dateStr) return 1.2;
@@ -227,7 +141,7 @@ export function getOscarSeasonBonus(dateStr, eligibilityYear) {
 
 // ─── Film title extraction ────────────────────────────────────────────────────
 
-const QUOTE_RE = /[''"""]([A-Z][^''"""\n]{1,60})[''"""]/g;
+const QUOTE_RE = /['""]([A-Z][^'""\n]{1,60})['""]/ ;
 const STOPWORDS = new Set([
   "The","A","An","But","And","For","In","On","At","To","Is","Are","Was","Were",
   "Will","Has","Have","This","That","These","Those","It","He","She","They",
@@ -237,7 +151,7 @@ const STOPWORDS = new Set([
 
 export function extractFilmTitles(text) {
   const seen = new Set();
-  for (const m of text.matchAll(QUOTE_RE)) {
+  for (const m of text.matchAll(new RegExp(QUOTE_RE.source, "g"))) {
     const t = m[1].trim();
     if (
       t.length < 2 || t.length > 70 ||
